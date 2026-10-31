@@ -1,0 +1,436 @@
+<!DOCTYPE html>
+<html lang="nl">
+<head>
+<meta charset="UTF-8">
+<title>Procedural Circuit Racer</title>
+<style>
+  body { margin: 0; overflow: hidden; background: #000; font-family: system-ui, sans-serif; }
+  #hud { position: absolute; top: 12px; left: 12px; color: #fff; text-shadow: 0 0 4px #000; font-size: 18px; pointer-events: none; }
+  #speed { position: absolute; bottom: 20px; right: 30px; color: #fff; font-size: 42px; font-weight: bold; text-shadow: 0 0 6px #000; }
+  #pos { position: absolute; top: 12px; right: 20px; color: #fff; font-size: 28px; font-weight: bold; text-shadow: 0 0 6px #000; }
+  #help { position: absolute; bottom: 12px; left: 12px; color: #aaa; font-size: 14px; }
+</style>
+</head>
+<body>
+<div id="hud">Ronde: 1/3<br>Positie: -</div>
+<div id="speed">0 km/h</div>
+<div id="pos">1e</div>
+<div id="help">WASD of pijltjes | Space = handrem | R = reset</div>
+
+<script type="importmap">
+{
+  "imports": {
+    "three": "https://cdn.jsdelivr.net/npm/three@0.170.0/build/three.module.js"
+  }
+}
+</script>
+
+<script type="module">
+import * as THREE from 'three';
+
+const NUM_AI = 10;
+const TOTAL_LAPS = 3;
+const TRACK_POINTS = 256;
+const ROAD_WIDTH = 12;
+
+let scene, camera, renderer, clock;
+let player, cars = [];
+let trackPoints = [], trackTangents = [], trackUp = [];
+let barriers = [];
+let keys = {};
+let lap = 1, position = 1;
+let audioCtx, engineOsc;
+
+init();
+
+function init() {
+  scene = new THREE.Scene();
+  scene.fog = new THREE.Fog(0x87ceeb, 80, 450);
+  scene.background = new THREE.Color(0x87ceeb);
+
+  camera = new THREE.PerspectiveCamera(65, innerWidth / innerHeight, 0.1, 1000);
+
+  renderer = new THREE.WebGLRenderer({ antialias: true });
+  renderer.setSize(innerWidth, innerHeight);
+  renderer.shadowMap.enabled = true;
+  document.body.appendChild(renderer.domElement);
+
+  // Lights
+  const hemi = new THREE.HemisphereLight(0xffffff, 0x444444, 0.8);
+  scene.add(hemi);
+  const dir = new THREE.DirectionalLight(0xffffff, 1.2);
+  dir.position.set(50, 100, 30);
+  dir.castShadow = true;
+  dir.shadow.mapSize.set(2048, 2048);
+  scene.add(dir);
+
+  generateTrack();
+  createEnvironment();
+  createCars();
+
+  clock = new THREE.Clock();
+  window.addEventListener('resize', onResize);
+  window.addEventListener('keydown', e => keys[e.code] = true);
+  window.addEventListener('keyup', e => keys[e.code] = false);
+
+  // Simple procedural engine sound
+  try {
+    audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+    engineOsc = audioCtx.createOscillator();
+    const gain = audioCtx.createGain();
+    engineOsc.type = 'sawtooth';
+    engineOsc.connect(gain);
+    gain.connect(audioCtx.destination);
+    gain.gain.value = 0.08;
+    engineOsc.start();
+  } catch(e) {}
+
+  animate();
+}
+
+function generateTrack() {
+  // Parametric closed circuit (figure-8-ish + hills)
+  for (let i = 0; i < TRACK_POINTS; i++) {
+    const t = (i / TRACK_POINTS) * Math.PI * 2;
+    const x = Math.sin(t) * 80 + Math.sin(t * 2) * 20;
+    const z = Math.cos(t) * 55 + Math.cos(t * 3) * 15;
+    const y = Math.sin(t * 2) * 4 + Math.sin(t * 5) * 1.5;
+    trackPoints.push(new THREE.Vector3(x, y, z));
+  }
+
+  // Tangents + up vectors
+  for (let i = 0; i < TRACK_POINTS; i++) {
+    const next = trackPoints[(i + 1) % TRACK_POINTS];
+    const prev = trackPoints[(i - 1 + TRACK_POINTS) % TRACK_POINTS];
+    const tan = new THREE.Vector3().subVectors(next, prev).normalize();
+    trackTangents.push(tan);
+    const up = new THREE.Vector3(0, 1, 0);
+    const right = new THREE.Vector3().crossVectors(tan, up).normalize();
+    trackUp.push(new THREE.Vector3().crossVectors(right, tan).normalize());
+  }
+
+  // Road mesh
+  const roadGeom = new THREE.BufferGeometry();
+  const positions = [], normals = [], uvs = [];
+  for (let i = 0; i < TRACK_POINTS; i++) {
+    const p = trackPoints[i];
+    const tan = trackTangents[i];
+    const up = trackUp[i];
+    const right = new THREE.Vector3().crossVectors(tan, up).normalize();
+
+    const left = p.clone().add(right.clone().multiplyScalar(-ROAD_WIDTH / 2));
+    const rightP = p.clone().add(right.clone().multiplyScalar(ROAD_WIDTH / 2));
+
+    positions.push(left.x, left.y, left.z, rightP.x, rightP.y, rightP.z);
+    normals.push(up.x, up.y, up.z, up.x, up.y, up.z);
+    uvs.push(0, i / 4, 1, i / 4);
+  }
+  // Close the loop
+  const p0 = trackPoints[0];
+  const tan0 = trackTangents[0];
+  const up0 = trackUp[0];
+  const right0 = new THREE.Vector3().crossVectors(tan0, up0).normalize();
+  positions.push(
+    p0.clone().add(right0.clone().multiplyScalar(-ROAD_WIDTH / 2)).x,
+    p0.y, 
+    p0.clone().add(right0.clone().multiplyScalar(-ROAD_WIDTH / 2)).z,
+    p0.clone().add(right0.clone().multiplyScalar(ROAD_WIDTH / 2)).x,
+    p0.y,
+    p0.clone().add(right0.clone().multiplyScalar(ROAD_WIDTH / 2)).z
+  );
+
+  roadGeom.setAttribute('position', new THREE.Float32BufferAttribute(positions, 3));
+  roadGeom.setAttribute('normal', new THREE.Float32BufferAttribute(normals, 3));
+  roadGeom.setIndex(buildIndices(TRACK_POINTS));
+
+  const roadMat = new THREE.MeshStandardMaterial({ color: 0x333333, roughness: 0.85 });
+  const road = new THREE.Mesh(roadGeom, roadMat);
+  road.receiveShadow = true;
+  scene.add(road);
+
+  // Barriers
+  const barrierGeom = new THREE.BoxGeometry(0.4, 0.8, 2);
+  const barrierMat = new THREE.MeshStandardMaterial({ color: 0xff2222 });
+  for (let i = 0; i < TRACK_POINTS; i += 2) {
+    const p = trackPoints[i];
+    const tan = trackTangents[i];
+    const right = new THREE.Vector3().crossVectors(tan, new THREE.Vector3(0,1,0)).normalize();
+    for (let side of [-1, 1]) {
+      const b = new THREE.Mesh(barrierGeom, barrierMat);
+      b.position.copy(p).add(right.clone().multiplyScalar(side * (ROAD_WIDTH / 2 + 0.6)));
+      b.position.y += 0.4;
+      b.lookAt(b.position.clone().add(tan));
+      b.castShadow = true;
+      scene.add(b);
+      barriers.push(b);
+    }
+  }
+}
+
+function buildIndices(n) {
+  const idx = [];
+  for (let i = 0; i < n; i++) {
+    const a = i * 2;
+    const b = a + 1;
+    const c = ((i + 1) % n) * 2;
+    const d = c + 1;
+    idx.push(a, c, b, b, c, d);
+  }
+  return idx;
+}
+
+function createEnvironment() {
+  // Ground
+  const ground = new THREE.Mesh(
+    new THREE.PlaneGeometry(800, 800),
+    new THREE.MeshStandardMaterial({ color: 0x3a7d34, roughness: 0.9 })
+  );
+  ground.rotation.x = -Math.PI / 2;
+  ground.receiveShadow = true;
+  scene.add(ground);
+
+  // Procedural trees
+  const treeGeom = new THREE.ConeGeometry(1.2, 4, 6);
+  const trunkGeom = new THREE.CylinderGeometry(0.3, 0.4, 1.5, 5);
+  const leafMat = new THREE.MeshStandardMaterial({ color: 0x2d5a27 });
+  const trunkMat = new THREE.MeshStandardMaterial({ color: 0x5c3a21 });
+
+  for (let i = 0; i < 180; i++) {
+    const angle = Math.random() * Math.PI * 2;
+    const dist = 40 + Math.random() * 180;
+    const x = Math.cos(angle) * dist;
+    const z = Math.sin(angle) * dist;
+    // Skip if too close to track
+    let tooClose = false;
+    for (const p of trackPoints) {
+      if (p.distanceTo(new THREE.Vector3(x, 0, z)) < 18) { tooClose = true; break; }
+    }
+    if (tooClose) continue;
+
+    const tree = new THREE.Group();
+    const leaves = new THREE.Mesh(treeGeom, leafMat);
+    leaves.position.y = 2.8;
+    leaves.castShadow = true;
+    const trunk = new THREE.Mesh(trunkGeom, trunkMat);
+    trunk.position.y = 0.75;
+    trunk.castShadow = true;
+    tree.add(leaves, trunk);
+    tree.position.set(x, 0, z);
+    scene.add(tree);
+  }
+}
+
+function createCar(color, isPlayer = false) {
+  const group = new THREE.Group();
+
+  // Body
+  const body = new THREE.Mesh(
+    new THREE.BoxGeometry(1.8, 0.6, 3.6),
+    new THREE.MeshStandardMaterial({ color, metalness: 0.4, roughness: 0.3 })
+  );
+  body.position.y = 0.5;
+  body.castShadow = true;
+  group.add(body);
+
+  // Cabin
+  const cabin = new THREE.Mesh(
+    new THREE.BoxGeometry(1.5, 0.5, 1.6),
+    new THREE.MeshStandardMaterial({ color: 0x222222, metalness: 0.6, roughness: 0.1 })
+  );
+  cabin.position.set(0, 0.9, -0.2);
+  cabin.castShadow = true;
+  group.add(cabin);
+
+  // Wheels
+  const wheelGeom = new THREE.CylinderGeometry(0.35, 0.35, 0.25, 12);
+  wheelGeom.rotateZ(Math.PI / 2);
+  const wheelMat = new THREE.MeshStandardMaterial({ color: 0x111111 });
+  const wheels = [];
+  const offsets = [
+    [-0.85, 0.35, 1.2],
+    [0.85, 0.35, 1.2],
+    [-0.85, 0.35, -1.2],
+    [0.85, 0.35, -1.2]
+  ];
+  for (const o of offsets) {
+    const w = new THREE.Mesh(wheelGeom, wheelMat);
+    w.position.set(...o);
+    w.castShadow = true;
+    group.add(w);
+    wheels.push(w);
+  }
+
+  const car = {
+    group,
+    wheels,
+    color,
+    isPlayer,
+    pos: new THREE.Vector3(),
+    vel: new THREE.Vector3(),
+    heading: 0,
+    speed: 0,
+    progress: 0,
+    lap: 0,
+    lastProgress: 0
+  };
+
+  // Start position
+  const startIdx = isPlayer ? 0 : Math.floor(Math.random() * 40) + 5;
+  const p = trackPoints[startIdx];
+  const tan = trackTangents[startIdx];
+  car.pos.copy(p);
+  car.pos.y += 0.6;
+  car.heading = Math.atan2(tan.x, tan.z);
+  car.progress = startIdx / TRACK_POINTS;
+
+  group.position.copy(car.pos);
+  group.rotation.y = car.heading;
+  scene.add(group);
+  return car;
+}
+
+function createCars() {
+  player = createCar(0xff3333, true);
+  cars.push(player);
+
+  const colors = [0x3366ff, 0x33ff66, 0xffff33, 0xff66ff, 0xff9933, 0x66ffff, 0xffffff, 0x9933ff, 0x33ff99, 0xff3399];
+  for (let i = 0; i < NUM_AI; i++) {
+    cars.push(createCar(colors[i % colors.length]));
+  }
+}
+
+function updateCar(car, dt, throttle, steer, brake) {
+  // Medium physics
+  const maxSpeed = car.isPlayer ? 42 : 38 + Math.random() * 4;
+  const accel = 28;
+  const brakeForce = 45;
+  const grip = 0.85;
+  const drag = 0.98;
+
+  if (throttle > 0) car.speed += accel * throttle * dt;
+  if (brake > 0) car.speed -= brakeForce * brake * dt;
+  car.speed = Math.max(-8, Math.min(maxSpeed, car.speed));
+  car.speed *= Math.pow(drag, dt * 60);
+
+  // Steering with speed-dependent grip
+  const steerInfluence = Math.min(1, 18 / (Math.abs(car.speed) + 5));
+  car.heading += steer * steerInfluence * (car.speed / maxSpeed) * 2.2 * dt * (brake > 0.5 ? 1.6 : 1);
+
+  const forward = new THREE.Vector3(Math.sin(car.heading), 0, Math.cos(car.heading));
+  car.vel.copy(forward).multiplyScalar(car.speed);
+
+  // Simple lateral friction
+  car.pos.add(car.vel.clone().multiplyScalar(dt));
+
+  // Keep roughly on track height
+  let closest = 0, minDist = Infinity;
+  for (let i = 0; i < TRACK_POINTS; i++) {
+    const d = car.pos.distanceTo(trackPoints[i]);
+    if (d < minDist) { minDist = d; closest = i; }
+  }
+  car.pos.y = trackPoints[closest].y + 0.6;
+
+  // Barrier collision (simple push back)
+  for (const b of barriers) {
+    if (car.pos.distanceTo(b.position) < 2.2) {
+      const push = car.pos.clone().sub(b.position).normalize();
+      car.pos.add(push.multiplyScalar(0.15));
+      car.speed *= 0.92;
+    }
+  }
+
+  // Progress for AI and position
+  car.progress = closest / TRACK_POINTS;
+  if (car.progress < car.lastProgress - 0.5) car.lap++;
+  car.lastProgress = car.progress;
+
+  // Wheels rotation
+  const wheelRot = car.speed * dt * 2.5;
+  car.wheels.forEach(w => w.rotation.x += wheelRot);
+
+  car.group.position.copy(car.pos);
+  car.group.rotation.y = car.heading;
+}
+
+function updateAI(car, dt) {
+  // Pure pursuit-ish
+  const lookAhead = 8 + Math.abs(car.speed) * 0.15;
+  let targetIdx = Math.floor(car.progress * TRACK_POINTS + lookAhead) % TRACK_POINTS;
+  const target = trackPoints[targetIdx];
+  const toTarget = target.clone().sub(car.pos);
+  const desiredHeading = Math.atan2(toTarget.x, toTarget.z);
+  let diff = desiredHeading - car.heading;
+  while (diff > Math.PI) diff -= Math.PI * 2;
+  while (diff < -Math.PI) diff += Math.PI * 2;
+
+  const steer = THREE.MathUtils.clamp(diff * 1.8, -1, 1);
+  const throttle = Math.abs(diff) < 0.6 ? 1 : 0.55;
+  const brake = Math.abs(diff) > 1.1 ? 0.7 : 0;
+
+  updateCar(car, dt, throttle, steer, brake);
+}
+
+function updatePlayer(dt) {
+  let throttle = 0, steer = 0, brake = 0;
+  if (keys['KeyW'] || keys['ArrowUp']) throttle = 1;
+  if (keys['KeyS'] || keys['ArrowDown']) throttle = -0.4;
+  if (keys['KeyA'] || keys['ArrowLeft']) steer = 1;
+  if (keys['KeyD'] || keys['ArrowRight']) steer = -1;
+  if (keys['Space']) brake = 1;
+  if (keys['KeyR']) {
+    // reset
+    player.pos.copy(trackPoints[0]);
+    player.pos.y += 0.6;
+    player.speed = 0;
+    player.heading = Math.atan2(trackTangents[0].x, trackTangents[0].z);
+  }
+
+  updateCar(player, dt, throttle, steer, brake);
+
+  // Engine sound pitch
+  if (engineOsc) {
+    engineOsc.frequency.value = 80 + Math.abs(player.speed) * 4.5;
+  }
+}
+
+function updatePositions() {
+  const sorted = [...cars].sort((a, b) => {
+    const aScore = a.lap + a.progress;
+    const bScore = b.lap + b.progress;
+    return bScore - aScore;
+  });
+  position = sorted.findIndex(c => c === player) + 1;
+  lap = Math.min(player.lap + 1, TOTAL_LAPS);
+}
+
+function animate() {
+  requestAnimationFrame(animate);
+  const dt = Math.min(clock.getDelta(), 0.05);
+
+  updatePlayer(dt);
+  cars.forEach(c => { if (!c.isPlayer) updateAI(c, dt); });
+  updatePositions();
+
+  // Chase camera
+  const offset = new THREE.Vector3(0, 3.2, -7.5);
+  offset.applyAxisAngle(new THREE.Vector3(0, 1, 0), player.heading);
+  camera.position.copy(player.pos).add(offset);
+  camera.lookAt(player.pos.clone().add(new THREE.Vector3(0, 1.2, 0)));
+
+  // HUD
+  document.getElementById('hud').innerHTML = `Ronde: ${lap}/${TOTAL_LAPS}<br>Positie: ${position}`;
+  document.getElementById('speed').textContent = Math.round(Math.abs(player.speed) * 3.6) + ' km/h';
+  const suffixes = ['e','e','e','e','e','e','e','e','e','e','e','e','e','e','e','e'];
+  document.getElementById('pos').textContent = position + suffixes[position-1] || 'e';
+
+  renderer.render(scene, camera);
+}
+
+function onResize() {
+  camera.aspect = innerWidth / innerHeight;
+  camera.updateProjectionMatrix();
+  renderer.setSize(innerWidth, innerHeight);
+}
+</script>
+</body>
+</html>
